@@ -1,0 +1,698 @@
+---
+title: "RNAseq_analysis_code"
+author: "John Frank"
+date: "3/3/2022"
+output: pdf_document
+---
+##Introduction
+This file contains code for the analysis of RNAseq data generated from JLat Control and A3AKO cells treated with PBS or IFNa as well as ISRE motif analyses of promoters identified as differentially expressed. Code for the genome-wide scan and enrichment analysis for ISREs is also included in file.
+
+#RNAseq fastq processing
+```{bash}
+# the following processing steps were executed for each sample.
+# concatenate fastq files from lanes of RNAseq run. 
+ls *R1*
+A3AKO-IFNa-1_S8_L001_R1_001.fastq.gz  A3AKO-IFNa-1_S8_L002_R1_001.fastq.gz  A3AKO-IFNa-1_S8_L003_R1_001.fastq.gz  A3AKO-IFNa-1_S8_L004_R1_001.fastq.gz
+ls *R2*
+A3AKO-IFNa-1_S8_L001_R2_001.fastq.gz  A3AKO-IFNa-1_S8_L002_R2_001.fastq.gz  A3AKO-IFNa-1_S8_L003_R2_001.fastq.gz  A3AKO-IFNa-1_S8_L004_R2_001.fastq.gz
+cat *R1* > A3AKO-IFNa-1_R1.fastq.gz
+cat *R2* > A3AKO-IFNa-1_R2.fastq.gz
+
+# check read quality and trim low quality sequence using fastp
+/home/jaf266/project/software/fastp -i *_R1.fastq.gz -I *_R2.fastq.gz -o out_A3AKO-IFNa-1_R1.fastq.gz -O out_A3AKO-IFNa-1_R2.fastq.gz;
+
+# map reads to hg38 human genome assembly for each sample using STAR
+STAR --runThreadN 6 \
+--readFilesIn out_A3AKO-IFNa-1_R1.fastq.gz out_A3AKO-IFNa-1_R2.fastq.gz \
+--readFilesCommand gunzip -c \
+--genomeDir /home/jaf266/project/genomes/human/STAR_hg38_index \
+--outFileNamePrefix A3AKO-IFNa-1Aligned.sortedByCoord.out.bam \
+--outSAMtype BAM SortedByCoordinate \
+--outFilterMultimapNmax 100 \
+--winAnchorMultimapNmax 100
+
+# quantify transcripts with featureCounts
+featureCounts \ 
+-T 6 \
+-p -t exon -g gene_id \ 
+-a hg38.ncbiRefSeq.gtf \ 
+-o A3AKO-IFNa-1Aligned.sortedByCoord.out.bamcounts.txt \
+A3AKO-IFNa-1Aligned.sortedByCoord.out.bam
+
+# featureCounts output files were saved to a new directory. these files were processed as described below.
+```
+
+#load packages needed for DESeq analysis and file processing in R
+```{r}
+## load appropriate packages
+library(DESeq2)
+library(pheatmap)
+library(RColorBrewer)
+library(PoiClaClu)
+library(ggplot2)
+library(tidyr)
+library(ggthemes)
+library(genefilter)
+library(tidyverse)
+library(plyr)
+```
+
+#combine separate count tables into a single file for DESeq
+```{r}
+#set working directory
+## note: this directory must contain the count files of interest.
+setwd("/Volumes/G-DRIVE USB-C/professional/Iwasaki_research/RNASeq/JLat_IFNa/featureCounts_cnt/counts/")
+
+#import count table file previously processed in bash
+files <- list.files("/Volumes/G-DRIVE USB-C/professional/Iwasaki_research/RNASeq/JLat_IFNa/featureCounts_cnt/counts/")
+
+for(filename in files){
+  print(filename)
+}
+
+allFiles.list <- lapply(files, read.table, header = TRUE, sep = '\t')
+
+#Now combine second column of dataframes into a single table using dplyr
+counts <- bind_cols(allFiles.list)
+countsDES <- counts[ ,c(1,7,14,21,28,35,42,49,56,63,70,77,84)] 
+
+#head(countsDES)
+write.table(countsDES, file = "/Users/johnfrank/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051113_JLat_IFNa/051321_featureCounts_counts.txt", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE) #note: header names may need to be edited in bash to make the sample IDs more readable.
+
+#used sed in bash to adjust column headers
+#sed -i '' 's/Aligned.sortedByCoord.out.bam//g' 051321_featureCounts_counts.txt 
+```
+
+#prepare data and define analysis parameters for DESeq2
+```{r}
+#set working directory
+setwd("/Users/johnfrank/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051113_JLat_IFNa/")
+
+#import data from tab delimited file with heaaders and the first column denoting row names and convert datafram to matrix
+TEL_counts <- as.matrix(read.delim("/Users/johnfrank/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051113_JLat_IFNa/featureCounts_out/051321_featureCounts_counts.txt", header = TRUE, sep = "\t", row.names = 1))
+#specify the identity of values as numeric integers
+storage.mode(TEL_counts) = "integer"
+#import experimental design file required for DESeq to know what samples to compare. 
+## this file will need to be manually generated in vim or some other text editor.
+design <- read.delim("051321_design.txt", header = TRUE, sep = "\t", row.names = 1)
+
+#convert to DESeq2 matrix
+## countData = specifies data matrix containing counts
+## coldata = refers to the experiment design file identity
+## design = specifies the levels of analysis 
+dds <- DESeqDataSetFromMatrix(countData = TEL_counts, 
+                              colData = design, 
+                              design = ~ 1 + genotype + condition + genotype:condition)
+
+# keep only genes with at least 3 samples and a count of 1 or higher
+keep <- rowSums(counts(dds) >= 1) >= 3
+dds <- dds[keep,]
+
+#set reference for design columns
+dds$condition <- relevel(dds$condition, ref = "PBS") #this should set PBS as the denominator (i.e. reference)
+dds$genotype <- relevel(dds$genotype, ref = "control") #this should set control cells as denominator (i.e. reference)
+
+## perform quality checks to make sure data looks good
+# data transformation to account for variance that could inflate statistics
+dds_rld <- rlog(dds, blind = FALSE)
+
+## plot sample distance in PCA plot 
+PCAgc <- plotPCA(dds_rld, intgroup=c("genotype", "condition")) #annotating both genotype and condition as the reference
+```
+
+# perform DESeq analysis
+```{r}
+#set working directory
+setwd("/Users/johnfrank/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051113_JLat_IFNa/")
+## perform DESeq analysis 
+dds <- DESeq(dds)
+#list out names of comparisons
+resultsNames(dds)
+# set up model matrix
+mod_mat <- model.matrix(design(dds), colData(dds))
+
+## summarize DESeq results 
+# IFN vs PBS in control
+res_IvP_con <- results(dds, contrast = list(c("condition_IFNa_vs_PBS")))
+# IFN vs PBS in A3AKO
+res_IvP_A3A <- results(dds, contrast = list(c("condition_IFNa_vs_PBS", "genotypeA3AKO.conditionIFNa")))
+# do A3AKO and Control respond differently to IFN?
+dif_AvC_IFN <- results(dds, contrast = list(c("genotypeA3AKO.conditionIFNa")))
+
+## export results based on different filtering criteria
+#export each file
+#write.csv(res_IvP_con, file="res_IvP_con_featureCounts_DESeq2.csv")
+#write.csv(res_IvP_A3A, file="res_IvP_A3A_featureCounts_DESeq2.csv")
+#write.csv(dif_AvC_IFN, file="dif_AvC_IFN_featureCounts_DESeq2.csv")
+```
+
+#subset data and perform GO analysis of IFN vs PBS in control samples
+```{r}
+#load packages required for ClusterProfiler GO analysis
+library(clusterProfiler)
+library(ggnewscale)
+library(org.Hs.eg.db)
+
+#note the following is used when processing DESeq files previously exported as csv files
+# import data from csv file
+res_IvP_con <- read.csv("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/featureCounts_out/res_IvP_con_featureCounts_DESeq2.csv", header=TRUE)
+res_IvP_con <- dplyr::rename(res_IvP_con, GeneID = X) #edit gene header
+res_IvP_con_sig_up <- dplyr::filter(res_IvP_con, padj < 0.1 & log2FoldChange >= 1) #filter on significantly upregulated genes
+#compare_down <- dplyr::filter(compare_sig, padj < 0.1 &log2FoldChange < -1) #filter on significantly downregulated genes
+
+## GO enrichment test of Biological process (BP)
+#with gene symbols 
+egoBP <- enrichGO(gene        = IvP_con_sig_up$GeneID,
+                 OrgDb         = org.Hs.eg.db,
+                 keyType       = 'SYMBOL',
+                 ont           = "BP",
+                 pAdjustMethod = "BH",
+                 pvalueCutoff  = 0.05,
+                 qvalueCutoff  = 0.05)
+#remove redundant GO terms
+ego_simplified <- clusterProfiler::simplify(egoBP)
+BP <- clusterProfiler::dotplot(ego_simplified, 
+              showCategory=12,
+              title = "GOBP of upregulated genes in IFNa treated JLat Control (L2FC >= 1, padj < 0.1)")
+
+#egoBP_df <- as.data.frame(ego_simplified)
+
+```
+
+#subset data and perform GO analysis IFN vs PBS in A3AKO samples
+```{r}
+#note the following is used when processing DESeq files previously exported as csv files
+# import data from csv file
+res_IvP_A3A <- read.csv("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/featureCounts_out/res_IvP_A3A_featureCounts_DESeq2.csv", header=TRUE)
+res_IvP_A3A <- dplyr::rename(res_IvP_A3A, GeneID = X) #edit gene header
+res_IvP_A3A_sig_up <- dplyr::filter(res_IvP_A3A, padj < 0.1 & log2FoldChange >= 1) #filter on significantly up-regulated genes
+
+## GO enrichment test of Biological process (BP)
+#with gene symbols
+egoBP <- enrichGO(gene        = res_IvP_A3A_sig_up$GeneID,
+                 OrgDb         = org.Hs.eg.db,
+                 keyType       = 'SYMBOL',
+                 ont           = "BP",
+                 pAdjustMethod = "BH",
+                 pvalueCutoff  = 0.05,
+                 qvalueCutoff  = 0.05)
+#remove redundant GO terms
+ego_simplified <- simplify(egoBP)
+BP <- dotplot(ego_simplified, 
+              showCategory=12,
+              title = "GOBP of upregulated genes in IFNa treated JLat A3AKO (L2FC >= 1, padj < 0.1)")
+
+#egoBP_df <- as.data.frame(ego_simplified)
+```
+
+#subset data and perform GO analysis differences in gene expresseion comparing A3AKO vs control cells
+```{r}
+#note the following is used when processing DESeq files previously exported as csv files
+# import data from csv file
+dif_AvC_IFN <- read.csv("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/featureCounts_out/dif_AvC_IFN_featureCounts_DESeq2.csv", header=TRUE)
+dif_AvC_IFN <- dplyr::rename(dif_AvC_IFN, GeneID = X) #edit gene header
+dif_AvC_IFN_up <- dplyr::filter(dif_AvC_IFN, padj <= 0.1 & log2FoldChange >= 0.1) #filter on significantly up-regulated genes
+
+# GO enrichment test of Biological process (BP)
+#with gene symbols BP
+egoBP <- enrichGO(gene        = dif_AvC_IFN_up$GeneID,
+                 OrgDb         = org.Hs.eg.db,
+                 keyType       = 'SYMBOL',
+                 ont           = "BP",
+                 pAdjustMethod = "BH",
+                 pvalueCutoff  = 0.05,
+                 qvalueCutoff  = 0.05)
+#remove redundant GO terms
+ego_simplified <- simplify(egoBP)
+BP <- dotplot(ego_simplified, 
+              showCategory=8,
+              #title = "GOBP of differentially up-regulated genes (A3AKO/C, L2FC >= 0.1, padj < 0.1)"
+              )
+#heatplot(ego_simplified, foldChange=unique_virus_receptor$V1, showCategory=15)
+
+#egoBP_df <- as.data.frame(ego_simplified)
+```
+
+#process and plot DEG data 
+```{r}
+#load EnhancedVolcano package
+library(EnhancedVolcano)
+
+#set working directory
+setwd("/Users/johnfrank/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/")
+
+#import DESeq results
+## IFN vs PBS in control cells
+IvPC_DEG <- read.csv("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/featureCounts_out/res_IvP_con_featureCounts_DESeq2.csv", header=TRUE)
+IvPC_DEG <- dplyr::rename(IvPC_DEG, gene = X) #edit gene header
+IvPC_DEG <- dplyr::rename(IvPC_DEG, L2FC_IvPC = log2FoldChange) #edit fold change header to denote sample source
+
+## IFN vs PBS in A3AKO cells
+IvPA_DEG <- read.csv("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/featureCounts_out/res_IvP_A3A_featureCounts_DESeq2.csv", header=TRUE)
+IvPA_DEG <- dplyr::rename(IvPA_DEG, gene = X)  #edit gene header
+IvPA_DEG <- dplyr::rename(IvPA_DEG, L2FC_IvPA = log2FoldChange) #edit fold change header to denote sample source
+
+dif_AvC_IFN <- read.csv("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/featureCounts_out/dif_AvC_IFN_featureCounts_DESeq2.csv", header = T)
+dif_AvC_IFN <- dplyr::rename(dif_AvC_IFN, gene = X)
+
+#plot data as volcano plots
+## plot complete DESEq results for IvP from control cells
+c_IFN_plot <- EnhancedVolcano(IvPC_DEG,
+                lab = IvPC_DEG$gene,
+                x = 'L2FC_IvPC',
+                y = 'pvalue',
+                xlim = c(-4, 10),
+                ylim = c(-10, 350),
+                #title = 'differentially expressed genes IvPC',
+                pCutoff = 0.001,
+                FCcutoff = 1,
+                pointSize = 0.5,
+                labSize = 6.0,
+                drawConnectors = F,
+                widthConnectors = 0.5
+                )
+
+## plot complete DESEq results for IvP from A3AKO cells
+A3AKO_IFN_plot <- EnhancedVolcano(IvPA_DEG,
+                lab = IvPA_DEG$gene,
+                x = 'L2FC_IvPA',
+                y = 'pvalue',
+                xlim = c(-4, 10),
+                ylim = c(-10, 350),
+                #title = 'differentially expressed genes IvPA',
+                pCutoff = 0.001,
+                FCcutoff = 1,
+                pointSize = 0.5,
+                labSize = 6.0,
+                drawConnectors = F,
+                widthConnectors = 0.5
+                )
+
+## plot complete DESEq results for the difference between IFN treated A3AKO and control Samples
+### generate vector of differentially elevated genes including ISG15 for labeling in volcano plot
+dif_AvC_IFN_up <- dplyr::filter(dif_AvC_IFN, padj <= 0.1 & log2FoldChange >= 0.1)
+genes <- c(dif_AvC_IFN_up$gene, 'ISG15')
+
+dif_plot <- EnhancedVolcano(dif_AvC_IFN,
+                lab = dif_AvC_IFN$gene,
+                x = 'log2FoldChange',
+                y = 'pvalue',
+                xlim = c(-2.5, 5),
+                ylim = c(-2, 17),
+                #title = 'difference in IFNa-induced expression (A3AKO/Control)',
+                pCutoff = 0.0002,
+                FCcutoff = 0.1,
+                pointSize = 0.5,
+                labSize = 6.0,
+                drawConnectors = TRUE,
+                widthConnectors = 0.5,
+                selectLab = genes
+                )
+```
+
+#extract promoter sequences for DE-ISGs 
+```{r}
+#will use biomaRt and genomic ranges
+library(biomaRt)
+library(GenomicRanges)
+library(dplyr)
+
+#import differentially expressed genes
+dif_AvC_IFN <- read.csv("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/featureCounts_out/dif_AvC_IFN_featureCounts_DESeq2.csv", header=TRUE)
+dif_AvC_IFN <- dplyr::rename(dif_AvC_IFN, GeneID = X) #edit gene header
+dif_AvC_IFN_up <- dplyr::filter(dif_AvC_IFN, padj <= 0.1 & log2FoldChange >= 0.1) #filter on significantly
+
+#set up vector of GeneIDs 
+dif_genes <- dif_AvC_IFN_up$GeneID
+
+#access ensemble gene database
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+
+#get gene loci for differentially expresed genes
+dif_gene_loci <- getBM(c("hgnc_symbol", "chromosome_name", "strand","start_position","end_position"), 
+      "hgnc_symbol",
+      dif_genes,
+      ensembl)
+
+#edit strand column to be equivalent to + and - strand
+dif_gene_loci$strand[dif_gene_loci$strand == "1"] <- "+"
+dif_gene_loci$strand[dif_gene_loci$strand == "-1"] <- "-"
+
+# add chr identifier to chromosome name
+dif_gene_loci$chromosome_name <- sub("^","chr", dif_gene_loci$chromosome_name)
+#make gene range annotation
+gr <- makeGRangesFromDataFrame(dif_gene_loci,
+                         keep.extra.columns=FALSE,
+                         ignore.strand=FALSE,
+                         seqinfo=NULL,
+                         seqnames.field=c("seqnames", "seqname",
+                                          "chromosome", "chrom",
+                                          "chr", "chromosome_name",
+                                          "seqid"),
+                         start.field="start_position",
+                         end.field=c("end_position", "stop"),
+                         strand.field="strand",
+                         starts.in.df.are.0based=FALSE)
+
+#get promoter ranges of 1000 bp upstream and 500 bp downstream of gene start
+dif_gene_promoters <- as.data.frame(promoters(gr, 200, 50))
+
+#appned geneID to promoter range
+dif_gene_promoters2 <- dplyr::bind_cols(dif_gene_promoters, dif_gene_loci$hgnc_symbol)
+
+# reorder columns to bed format
+col_order <- c("seqnames", "start" ,"end", "...6", "width", "strand")
+dif_gene_promoters2.bed <- dif_gene_promoters2[, col_order]
+# export table to file for use with Bedtools
+setwd("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/dif_gene_promoter_analyses/")
+write.table(dif_gene_promoters2.bed, 
+            file="dif_AvC_IFN_promoter3.bed", 
+            col.names = FALSE,
+            row.names = FALSE,
+            quote = FALSE,
+            sep = "\t")
+```
+#get promoter sequences and identify enriched ISRE motifs
+```{bash}
+# get promoter sequences based on BED locations iwthin hg38
+bedtools getfasta -s -name -fi /home/jaf266/project/genomes/human/hg38.fa -bed dif_AvC_IFN_promoter3.bed -fo dif_AvC_IFN_promoter3.fasta
+# generate background sequences needed for homer.
+## this command yields the following file containing scrambled promoter sequences: dif_AvC_IFN_promoter2_scramble.fasta 
+scrambleFasta.pl dif_AvC_IFN_promoter3.fasta > dif_AvC_IFN_promoter3_scramble.fasta
+# use Homer: findMotifs.pl to search for possible ISREs
+findMotifs.pl dif_AvC_IFN_promoter3.fasta hg38 homer_fm -fasta dif_AvC_IFN_promoter3_scramble.fasta 
+```
+
+#identify upregulated ISGs common in control and A3A KO cells. 
+```{r}
+# import data from csv file
+dif_AvC_IFN <- read.csv("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/featureCounts_out/dif_AvC_IFN_featureCounts_DESeq2.csv", header=TRUE)
+dif_AvC_IFN <- dplyr::rename(dif_AvC_IFN, GeneID = X) #edit gene header
+dif_AvC_IFN_up <- dplyr::filter(dif_AvC_IFN, padj <= 0.1 & log2FoldChange >= 0.1) #filter on significantly upregulated genes
+
+res_IvP_A3A <- read.csv("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/featureCounts_out/res_IvP_A3A_featureCounts_DESeq2.csv", header=TRUE)
+res_IvP_A3A <- dplyr::rename(res_IvP_A3A, GeneID = X) #edit gene header
+res_IvP_A3A_sig_up <- dplyr::filter(res_IvP_A3A, padj < 0.1 & log2FoldChange >= 1) #filter on significantly upregulated genes
+
+res_IvP_con <- read.csv("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/featureCounts_out/res_IvP_con_featureCounts_DESeq2.csv", header=TRUE)
+res_IvP_con <- dplyr::rename(res_IvP_con, GeneID = X) #edit gene header
+res_IvP_con_sig_up <- dplyr::filter(res_IvP_con, padj < 0.1 & log2FoldChange >= 1) #filter on significantly upregulated genes
+
+# generate a list of ISGs that are shared between control and A3AKO lines
+cmn_IvP_sig_up <- dplyr::inner_join(res_IvP_A3A_sig_up, 
+                                    res_IvP_con_sig_up,
+                                    by = "GeneID")
+# filter out all ISGs that are not differentially elevated in A3AKO cells
+nodif_AvC_cmn_sig_up <- dplyr::anti_join(cmn_IvP_sig_up,
+                                     dif_AvC_IFN_up,
+                                     by = "GeneID")
+# now isolate GeneIDs and use to extract promoter sequences defined as 1000 bp upstream of gene start and 500bp downstream of gene start
+cmnup_genes <- nodif_AvC_cmn_sig_up$GeneID
+
+## will use biomaRt and genomic ranges
+library(biomaRt)
+library(GenomicRanges)
+## access ensemble gene database
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+
+##get gene loci for common upregulated ISGs
+cmnup_gene_loci <- getBM(c("hgnc_symbol", "chromosome_name", "strand","start_position","end_position"), 
+      "hgnc_symbol",
+      cmnup_genes,
+      ensembl)
+
+##edit strand column to be equivalent to + and - strand
+cmnup_gene_loci$strand[cmnup_gene_loci$strand == "1"] <- "+"
+cmnup_gene_loci$strand[cmnup_gene_loci$strand == "-1"] <- "-"
+
+## add chr identifier to chromosome name
+cmnup_gene_loci$chromosome_name <- sub("^","chr", cmnup_gene_loci$chromosome_name)
+## make gene range annotation
+gr <- makeGRangesFromDataFrame(cmnup_gene_loci,
+                         keep.extra.columns=FALSE,
+                         ignore.strand=FALSE,
+                         seqinfo=NULL,
+                         seqnames.field=c("seqnames", "seqname",
+                                          "chromosome", "chrom",
+                                          "chr", "chromosome_name",
+                                          "seqid"),
+                         start.field="start_position",
+                         end.field=c("end_position", "stop"),
+                         strand.field="strand",
+                         starts.in.df.are.0based=FALSE)
+
+##get promoter ranges of 1000 bp upstream and 500 bp downstream of gene start
+cmnup_gene_promoters <- as.data.frame(promoters(gr, 200, 50))
+
+##appned geneID to promoter range
+cmnup_gene_promoters2 <- dplyr::bind_cols(cmnup_gene_promoters, cmnup_gene_loci$hgnc_symbol)
+
+## reorder columns to bed format
+col_order <- c("seqnames", "start" ,"end", "...6", "width", "strand")
+cmnup_gene_promoters2 <- cmnup_gene_promoters2[, col_order]
+
+# export table to file for use with Bedtools
+setwd("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/dif_gene_promoter_analyses/")
+write.table(cmnup_gene_promoters2, 
+            file="cmnup_gene_promoter3.bed", 
+            col.names = FALSE,
+            row.names = FALSE,
+            quote = FALSE,
+            sep = "\t")
+```
+#get promoter sequences of common upregulated ISGs from the hg38 human genome assembly
+```{bash}
+# get promoter sequences based on BED locations within hg38
+bedtools getfasta -s -name -fi /home/jaf266/project/genomes/human/hg38.fa -bed cmnup_gene_promoter3.bed -fo cmnup_gene_promoter3.fasta
+```
+# Let's determine if there is a difference in enrichment of paired TTTC motifs separated by increasing nucleotide distances going from 0 (TTTCTTTC) to 10 (TTTCN(10)TTTC). I will compare DE-ISGs to a background of upregulated ISGs shared in both Control and A3AKO lines.
+```{bash}
+# generated custom TTTC motif file for homer2
+seq2profile.pl TTTC 0 TTTC > TTTC.motif
+seq2profile.pl TTTCTTTC 0 TTTCTTTC > TTTCTTTC.motif
+seq2profile.pl TTTCNTTTC 0 TTTCNTTTC > TTTCNTTTC.motif
+seq2profile.pl TTTCNNTTTC 0 TTTCNNTTTC > TTTCN2TTTC.motif
+seq2profile.pl TTTCNNNTTTC 0 TTTCNNNTTTC > TTTCN3TTTC.motif
+seq2profile.pl TTTCNNNNTTTC 0 TTTCNNNNTTTC > TTTCN4TTTC.motif
+seq2profile.pl TTTCNNNNNTTTC 0 TTTCNNNNNTTTC > TTTCN5TTTC.motif
+seq2profile.pl TTTCNNNNNNTTTC 0 TTTCNNNNNNTTTC > TTTCN6TTTC.motif
+seq2profile.pl TTTCNNNNNNNTTTC 0 TTTCNNNNNNNTTTC > TTTCN7TTTC.motif
+seq2profile.pl TTTCNNNNNNNNTTTC 0 TTTCNNNNNNNNTTTC > TTTCN8TTTC.motif
+seq2profile.pl TTTCNNNNNNNNNTTTC 0 TTTCNNNNNNNNNTTTC > TTTCN9TTTC.motif
+seq2profile.pl TTTCNNNNNNNNNNTTTC 0 TTTCNNNNNNNNNNTTTC > TTTCN10TTTC.motif
+## concatenate the separate motif files into one library
+cat *TTTC.motif > TTTCgap.motif
+
+## use homer2 known to see if there is a difference in motif enrichment in common- and DE-ISG promoter sequences. I can use the common-ISG promoters as the background to my DE-ISGs
+homer2 known -i dif_AvC_IFN_promoter3.fasta -b cmnup_gene_promoter3.fasta -m TTTCgap.motif -o difvcmn.out -stat hypergeo
+
+```
+#plot the enrichment scores as bar plots.
+```{r}
+#import enrichment files
+library(readr)
+library(ggplot2)
+difvcmn <- read_delim("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/121321_dif_ISG_promoter_250/difvcmn.txt", "\t", escape_double = FALSE, trim_ws = TRUE)
+# reformat table
+difvcmn$motif <- difvcmn$`Motif Name`
+difvcmn$motif <- factor(difvcmn$motif, levels = c( "TTTCTTTC", "TTTCN(1)TTTC",  "TTTCN(2)TTTC", "TTTCN(3)TTTC", "TTTCN(4)TTTC", "TTTCN(5)TTTC", "TTTCN(6)TTTC", "TTTCN(7)TTTC", "TTTCN(8)TTTC", "TTTCN(9)TTTC","TTTCN(10)TTTC", "TTTC")) #need to make sure the 'Motif Name' contains the same names as indicated in these levels, otherwise R will not recognize the appropriate motif IDs and spit out NA in the column
+difvcmn$enrichment_ratio <- 2^(difvcmn$`Log2 enrichment ratio`)
+difvcmn$significance <- c("n.s", "n.s", "n.s", "n.s", "n.s", "n.s", "n.s", "n.s", "n.s", "n.s", "n.s", "n.s")
+
+# plot the enrichment scores
+dist_p <- ggplot(difvcmn, aes(x = motif, y = enrichment_ratio )) +
+  geom_bar(stat = "identity",
+    color = "black",
+    fill = "white") +
+#  geom_text(data = difvcmn, aes(label = significance),
+#            vjust = -1) +
+  ylim(0, 4) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+        axis.text.y = element_text(size = 14, face="bold"),
+        axis.title = element_text(size = 12)) +
+  ylab(label = "enrichment ratio (DE-ISG/common ISG")
+dist_p
+``` 
+#now need to identify the actual motifs and see if there are differences in the number of differently spaced motifs within promoters
+```{bash}
+# looked for motif instances in DE-ISGs and common-ISGS
+## run homer2 find on the DE-ISGs
+homer2 find -i dif_AvC_IFN_promoter3.fasta -m TTTCgap.motif -o dif_AvC_IFN_promoter3_hfind_TTTCgap.out 
+
+## run homer2 find on cmn
+homer2 find -i cmnup_gene_promoter3.fasta -m TTTCgap.motif -o cmnup_gene_promoter3_hfind_TTTCgap.out
+```
+#count up instances of TTTC motifs
+```{r}
+#set working directory
+ setwd("~/Desktop/Desktop - MacBook Pro/Yale_University/Iwasaki_Research_projects/APOBEC/RNAseq/051121_JLat_IFNa/121321_dif_ISG_promoter_250/")
+#import data
+library(readr)
+library(dplyr)
+library(ggplot2)
+cmnup_gene_promoter2_hfind_TTTCgap <- read_delim("cmnup_gene_promoter3_hfind_TTTCgap.out", "\t", escape_double = FALSE, col_names = FALSE, trim_ws = TRUE) 
+dif_AvC_IFN_promoter2_hfind_TTTCgap <- read_delim("dif_AvC_IFN_promoter3_hfind_TTTCgap.out", "\t", escape_double = FALSE, col_names = FALSE, trim_ws = TRUE)
+
+#reformat motif position data 
+cmnup_gene_promoter2_hfind_TTTCgap$position <- 125+(cmnup_gene_promoter2_hfind_TTTCgap$X2)
+dif_AvC_IFN_promoter2_hfind_TTTCgap$position <- 125+(dif_AvC_IFN_promoter2_hfind_TTTCgap$X2)
+#export updated tables as csv files
+#write.table(cmnup_gene_promoter2_hfind, file = "cmnup_gene_promoter2_hfind.csv", quote = F, sep = ",", row.names = F, col.names = F)
+
+# count up number of motif instances per gene 
+## for common ISGs
+cmnup_cnts_TTTCgap <- plyr::count(cmnup_gene_promoter2_hfind_TTTCgap, c("X1", "X4")) # counts up frequency of motifs within each gene promoter
+list1 <- 1:148
+cmnup_cnts_TTTCgap$group <- rep("common ISG", length(list1)) #add sample label
+## for DE-ISGs
+DE_ISG_TTTCgap <- plyr::count(dif_AvC_IFN_promoter2_hfind_TTTCgap, c("X1", "X4")) # counts up frequency of motifs within each gene promoter
+list2 <- 1:33
+DE_ISG_TTTCgap$group <- rep("DE-ISG", length(list2)) #add sample label
+## concatenate motif count tables
+motif_cnts <- dplyr::bind_rows(cmnup_cnts_TTTCgap, DE_ISG_TTTCgap)
+
+# subset data to only include TTTC motifs
+TTTC_cnts <- dplyr::filter(motif_cnts, X4 == "TTTC")
+
+# plot TTTC_cnts as box plot
+TTTCp <- ggplot(TTTC_cnts, aes(x = group, y = freq)) +
+  geom_boxplot(notch = F) + 
+  theme_classic() + 
+  #geom_jitter(width = 0.1) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1, size = 15, face="bold"),
+        axis.text.y = element_text(size = 15, face="bold"),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 12)) +
+  ylab(label = "TTTC motif count per ISG promoter")
+
+#test whether the difference in motif frequency is statistically significant
+#make data frame reordering per-gene TTTC motif counts as seperate columns
+TTTC_cnts_group <- TTTC_cnts %>% 
+  tidyr::pivot_wider(names_from = group,
+                     values_from = freq)
+# perform two tailed Welch's test because I do not know what the directionality of the difference should be.
+t.test(TTTC_cnts_group$`common ISG`, TTTC_cnts_group$`DE-ISG`)
+#	Welch Two Sample t-test
+
+#Welch Two Sample t-test
+
+#data:  TTTC_cnts_group$`common ISG` and TTTC_cnts_group$`DE-ISG`
+#t = -2.3929, df = 21.182, p-value = 0.02605
+#alternative hypothesis: true difference in means is not equal to 0
+#95 percent confidence interval:
+# -2.6698764 -0.1877185
+#sample estimates:
+#mean of x mean of y 
+# 3.696203  5.125000 
+```
+
+## perform genome wide scan for TTTC-pairs with spacers of varying sizes.
+```{bash}
+# generated custom TTTC motif file for homer2
+seq2profile.pl TTTCTTTC 0 TTTCTTTC > TTTCTTTC.motif
+seq2profile.pl TTTCNTTTC 0 TTTCNTTTC > TTTCNTTTC.motif
+seq2profile.pl TTTCNNTTTC 0 TTTCNNTTTC > TTTCN2TTTC.motif
+seq2profile.pl TTTCNNNTTTC 0 TTTCNNNTTTC > TTTCN3TTTC.motif
+seq2profile.pl TTTCNNNNTTTC 0 TTTCNNNNTTTC > TTTCN4TTTC.motif
+seq2profile.pl TTTCNNNNNTTTC 0 TTTCNNNNNTTTC > TTTCN5TTTC.motif
+seq2profile.pl TTTCNNNNNNTTTC 0 TTTCNNNNNNTTTC > TTTCN6TTTC.motif
+seq2profile.pl TTTCNNNNNNNTTTC 0 TTTCNNNNNNNTTTC > TTTCN7TTTC.motif
+seq2profile.pl TTTCNNNNNNNNTTTC 0 TTTCNNNNNNNNTTTC > TTTCN8TTTC.motif
+seq2profile.pl TTTCNNNNNNNNNTTTC 0 TTTCNNNNNNNNNTTTC > TTTCN9TTTC.motif
+seq2profile.pl TTTCNNNNNNNNNNTTTC 0 TTTCNNNNNNNNNNTTTC > TTTCN10TTTC.motif
+## concatenate the separate motif files into one library
+cat *TTTC.motif > TTTCpair.motif
+
+# use homer2 to scan the hg38 human genome assembly for TTTC-pair motifs
+scanMotifGenomeWide.pl TTTCpair.motif hg38 -bed -p 6
+# the output was saved to standard out. In this case the slurm-79849212.out
+## saved output bed file as the following:
+mv slurm-79849212.out homer2_TTTCpr_scn.bed
+## reformatted homer2 output as BEDTOOLS-compatible bed file.
+grep 'chr' homer2_TTTCpr_scn.bed > homer2_TTTCpr_scn_frmtd.bed
+sed -i '/Processing/d' homer2_TTTCpr_scn_frmtd.bed 
+sed -n '/chr/d' homer2_TTTCpr_scn_frmtd.bed 
+sed -i '/total/d' homer2_TTTCpr_scn_frmtd.bed 
+sort -k1,1 -k2,2n homer2_TTTCpr_scn_frmtd.bed > homer2_TTTCpr_scn_frmtd.sorted.bed 
+
+# obtained GENCODEv36 genome annotation file from UCSC genome browser. Then filtered table for only protein coding genes. 
+awk -F '\t' '$11 == "coding" { print }' hgTables_GENCODEV36.txt > hgTables_GENCODEV36_pc.txt
+# formmatted GENCODE table to BED format
+awk -F '\t' '{ print $1,$2,$3,$9,$5,$6}' hgTables_GENCODEV36_pc.txt > hgTables_GENCODEV36_pc.bed
+# sorted file for BEDTOOLs
+sort -k1,1 -k2,2n hgTables_GENCODEV36_pc.bed > hgTables_GENCODEV36_pc.sorted.bed
+
+# used BEDTOOLS to identify TTTC-pair motifs located upstream or within annotated genes
+# ran bedtools closest using the gene annotation as -a input and TTTCprs as -b input.
+# Distance will be calculated with respect to genes -D a
+# motifs downstream of genes will be ignored -id
+bedtools closest -a hgTables_GENCODEV36_pc.sorted.bed -b homer2_TTTCpr_scn_frmtd.sorted.bed -D a -id > pc-gn_TTTCpr_closest_Daid.txt
+
+## generate file with columns denoting distance between gene start and motif
+## calculate the distance of motifs from gene starts. 
+## for the positive strand ($6 = +): d = gene start ($2) - motif end ($9) = $14
+## for the negative strand ($6 = -): d = motif start ($8) - gene start ($3) = $15
+awk 'BEGIN {OFS="\t"}; { print $0, $2-$9}' pc-gn_TTTCpr_closest_Daid.txt | awk 'BEGIN {OFS="\t"}; {print $0, $8-$3}' > pc-gn_TTTCpr_closest_Daid_prm_d.txt
+
+# Filter based on motif distance from promoter
+## promoter window is defined as -200bp to +50bp relative to the gene start
+### +strand
+awk 'BEGIN {OFS="\t"}; { if($6 == "+" && $14 >=-50 && $14 <= 200) {print }}' pc-gn_TTTCpr_closest_Daid_prm_d.txt > pc-gn_TTTCpr_closest_Daid_prm_d_4sense.txt
+### -strand
+awk 'BEGIN {OFS="\t"}; { if($6 == "-" && $15 >=-50 && $15 <= 200) {print }}' pc-gn_TTTCpr_closest_Daid_prm_d.txt > pc-gn_TTTCpr_closest_Daid_prm_d_4anti.txt 
+### concatenate + and - strand files
+cat pc-gn_TTTCpr_closest_Daid_prm_d_4sense.txt pc-gn_TTTCpr_closest_Daid_prm_d_4anti.txt > pc-gn_TTTCpr_closest_Daid_prm_d_4.txt
+```
+# now that TTTC-pairs located within gene promoters have been identified. GO enrichment analyses were performed to determine if enrichment of GO terms could be identified.
+```{r}
+#load packages needed for the following analyses
+library(readr)
+library(dplyr)
+library(clusterProfiler)
+library(ggnewscale)
+library(org.Hs.eg.db)
+
+# import file into R:
+min_window <- read_delim("~/Desktop/Desktop - MacBook Pro/Yale_University/manabu_paper/090121_revisions/ISRE_enrichment_analysis/ISRE_gene_motif_enrich/pc-gn_TTTCpr_closest_Daid_prm_d_4.txt", 
+                          delim = "\t", 
+                          escape_double = FALSE, 
+                          col_names = FALSE, 
+                          trim_ws = TRUE)
+## filter on unique genes
+#min_genes <- distinct(min_window, X4)
+## use ClusterProfiler to search for enriched GO terms
+#egoBP_min <- enrichGO(gene        = min_genes$X4,
+#                   OrgDb         = org.Hs.eg.db,
+#                   keyType       = 'SYMBOL',
+#                   ont           = "BP",
+#                   pAdjustMethod = "BH",
+#                   pvalueCutoff  = 0.05,
+#                   qvalueCutoff  = 0.05)
+#ego_min_simplified <- clusterProfiler::simplify(egoBP_min)
+## visualize GO enrichment results
+#BP_min <- clusterProfiler::dotplot(ego_min_simplified, 
+#                                showCategory=12,
+                                #title = "min window (-200bp, +50bp)"
+#                               )
+
+# subset on genes where only isre motifs detected
+min_isre <- filter(min_window, X10 == "TTTCNNTTTC")
+
+## filter on unique genes
+min_isre_genes <- distinct(min_isre, X4)
+
+## use ClusterProfiler to search for enriched GO terms
+egoBP_min_isre <- enrichGO(gene        = min_isre_genes$X4,
+                   OrgDb         = org.Hs.eg.db,
+                   keyType       = 'SYMBOL',
+                   ont           = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff  = 0.05,
+                   qvalueCutoff  = 0.05)
+ego_min_isre_simplified <- clusterProfiler::simplify(egoBP_min_isre)
+BP_min_isre <- clusterProfiler::dotplot(ego_min_isre_simplified, 
+                                showCategory=12,
+                                #title = "isre min window (-200bp, +50bp)"
+                                )
+```
